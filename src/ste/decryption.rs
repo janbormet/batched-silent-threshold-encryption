@@ -200,8 +200,6 @@ mod tests {
         let n = 1 << 3;
         let l = 8;
         let t: usize = n / 2;
-        let log_max_input = 40;
-        let log_markers = 25;
         debug_assert!(t < n);
 
         let crs = CRS::new(n, l, &mut rng);
@@ -245,13 +243,11 @@ mod tests {
         let recovered_m = agg_dec(&partial_decryptions, &ct, &selector, &ak, &crs);
         assert_eq!(recovered_m, m);
 
-        // read the markers
-        let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
+        let path = "markers_bsgs_ste_test.bin";
         let markers = if std::path::Path::new(path).exists() {
             Markers::<PairingOutput<E>>::read_from_file(path)
         } else {
-            println!("Markers file not found, generating new markers...");
-            let m = Markers::<PairingOutput<E>>::new(log_max_input, log_markers);
+            let m = Markers::<PairingOutput<E>>::new();
             m.save_to_file(path);
             m
         };

@@ -1,12 +1,18 @@
-use crate::{bte, ste};
 use crate::{
-    bte::{PPRF, PRF},
-    ste::aggregate::EncryptionKey,
+    bte::{self, PPRF, PRF},
+    ste::{self, aggregate::EncryptionKey},
 };
 use ark_ec::pairing::{Pairing, PairingOutput};
 use ark_ec::PrimeGroup;
 use ark_ff::PrimeField;
 use ark_std::{rand::Rng, Zero};
+
+/// Bits per STE / GT chunk when decomposing the PRF scalar (must match `ste_crs.l`).
+/// Each chunk limb is in `[0, 2^CHUNK_BITS − 1]`. After homomorphically summing `B` ciphertexts,
+/// a slot sum is at most `B · (2^CHUNK_BITS − 1)`; see [`crate::dlog::max_homomorphic_batch_size`].
+pub const CHUNK_BITS: u32 = 16;
+/// Number of chunks; `CHUNK_BITS * NUM_CHUNKS` must cover the scalar field (~255 bits for BLS12-381).
+pub const NUM_CHUNKS: usize = 16;
 
 #[derive(Clone, Debug)]
 pub struct Ciphertext<E: Pairing> {
@@ -16,7 +22,7 @@ pub struct Ciphertext<E: Pairing> {
     pub mask: PairingOutput<E>, // todo: message masked with bytes
 }
 
-/// Sample a key, puncture it at position, and mask message at that evalaution point.
+/// Sample a key, puncture it at position, and mask message at that evaluation point.
 pub fn encrypt<E: Pairing>(
     position: usize,
     bte_crs: &bte::crs::CRS<E>,
@@ -25,49 +31,18 @@ pub fn encrypt<E: Pairing>(
     t: usize,
     rng: &mut impl Rng,
 ) -> Ciphertext<E> {
-    // sample a PRF key
-
     let prf = PRF::<E>::new(rng);
-
-    // puncture the PRF at the given position
     let pprf = prf.puncture(position, &bte_crs);
 
-    // split prf.key into 8 chunks of 32 bits each
-    let mut key = prf.key.clone();
-    let mut chunks = vec![E::ScalarField::zero(); 8];
+    // Split prf.key into `NUM_CHUNKS` chunks of `CHUNK_BITS` bits (little-endian).
+    let mut key = prf.key;
+    let mut chunks = vec![E::ScalarField::zero(); NUM_CHUNKS];
 
-    for i in 0..8 {
-        let q = key.into_bigint() >> 32;
-        chunks[i] = key - E::ScalarField::from_bigint(q << 32).unwrap();
-
+    for i in 0..NUM_CHUNKS {
+        let q = key.into_bigint() >> CHUNK_BITS;
+        chunks[i] = key - E::ScalarField::from_bigint(q << CHUNK_BITS).unwrap();
         key = E::ScalarField::from_bigint(q).unwrap();
     }
-
-    /*
-    #[cfg(debug_assertions)]
-    {
-        // assert that the all chunks are at most 32 bits
-        for chunk in &chunks {
-            assert!(chunk.into_bigint() <= E::ScalarField::from(1u128 << 32).into_bigint());
-        }
-        // assert that the sum of all chunks is equal to the original key
-        let mut sum = E::ScalarField::zero();
-        let mut offset = E::ScalarField::one();
-        for chunk in &chunks {
-            sum += offset * chunk;
-            offset *= E::ScalarField::from(1u128 << 32);
-        }
-
-        assert_eq!(sum, prf.key);
-    }
-
-    let chunks_t = ek
-        .e_gh
-        .iter()
-        .zip(chunks.iter())
-        .map(|(&e, c)| e * c)
-        .collect::<Vec<_>>();
-    */
 
     let gen_t = PairingOutput::<E>::generator();
     let chunks_t = chunks.iter().map(|c| gen_t * c).collect::<Vec<_>>();
@@ -94,7 +69,7 @@ pub mod tests {
     fn test_encrypt() {
         let mut rng = test_rng();
         let n = 1 << 3;
-        let l = 8;
+        let l = NUM_CHUNKS;
         let batch_size = 8;
         let t: usize = n / 2;
 

@@ -18,8 +18,6 @@ bincode = { version = "1.3" }
 
 hopcroft-karp = { git = "https://github.com/microgravitas/hopcroft-karp" }
 
-sha2 = { version = "0.10.5" }
-
 [features]
 asm = ["ark-ff/asm"]
 
@@ -38,23 +36,10 @@ harness = false
 name = "sbte_pd"
 harness = false
 
-
 [[bench]]
 name = "bte_pd"
 harness = false
 
-# [[bench]]
-# name = "decryption"
-# harness = false
-
-# [[bench]]
-# name = "interpolation"
-# harness = false
-
-# [[bench]]
-# name = "setup"
-# harness = false
-
-# [[bench]]
-# name = "batch_eval"
-# harness = false
+[[bench]]
+name = "batch_eval"
+harness = false

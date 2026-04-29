@@ -1,84 +1,166 @@
 use ark_ec::PrimeGroup;
 use ark_std::{end_timer, start_timer};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+use std::marker::PhantomData;
 
-/// Bases and markers to solve a DLog problem with the power in the range of [0, 2^size)
-/// log_max_input must be log_markers + log_bases
-/// The performance here has some interesting quirks that can be further optimized
+/// Maximum exponent the BSGS solver can handle: inputs must be in `[0, 2^DLOG_RANGE_BITS)`.
+///
+/// With `CHUNK_BITS = 16` this supports up to `floor((2^25 − 1) / (2^16 − 1)) = 512` ciphertexts
+/// summed homomorphically per STE slot.
+pub const DLOG_RANGE_BITS: usize = 25;
+
+/// Number of giant-step markers stored in the table (`2^13 = 8192`).
+pub const DLOG_MARKER_BITS: usize = 13;
+
+/// Number of baby steps at solve time (`2^12 = 4096`).  Must equal `DLOG_RANGE_BITS - DLOG_MARKER_BITS`.
+pub const DLOG_STEP_BITS: usize = DLOG_RANGE_BITS - DLOG_MARKER_BITS;
+
+/// Byte width for hash-map keys: first 16 bytes of the uncompressed point serialization.
+pub const DLOG_KEY_BYTES: usize = 16;
+
+/// Largest value a single chunk limb can take (`2^chunk_bits − 1`).
+#[inline]
+pub fn max_chunk_value(chunk_bits: u32) -> u128 {
+    assert!(chunk_bits < 128, "chunk_bits must be < 128");
+    (1u128 << chunk_bits) - 1
+}
+
+/// Maximum exponent the DLog solver can recover (`2^range_bits − 1`).
+#[inline]
+pub fn max_dlog_exponent(range_bits: usize) -> u128 {
+    assert!(range_bits < 128, "range_bits must be < 128");
+    (1u128 << range_bits) - 1
+}
+
+/// How many ciphertexts can be homomorphically summed without overflowing the DLog range per slot.
+///
+/// Each ciphertext contributes one chunk per slot; each chunk is in `[0, 2^chunk_bits − 1]`. After
+/// adding `B` ciphertexts, a slot sum is at most `B · (2^chunk_bits − 1)`. We require that to be
+/// `≤ 2^range_bits − 1` so `compute_dlog` can recover it.
+#[inline]
+pub fn max_homomorphic_batch_size(chunk_bits: u32, range_bits: usize) -> usize {
+    let m = max_chunk_value(chunk_bits);
+    let cap = max_dlog_exponent(range_bits);
+    if m == 0 {
+        return usize::MAX;
+    }
+    (cap / m) as usize
+}
+
+/// Panics if `batch_size` exceeds [`max_homomorphic_batch_size`] for the given parameters.
+#[inline]
+pub fn assert_homomorphic_batch_safe(batch_size: usize, chunk_bits: u32, range_bits: usize) {
+    let max_b = max_homomorphic_batch_size(chunk_bits, range_bits);
+    assert!(
+        batch_size <= max_b,
+        "homomorphic batch too large: batch_size={} but at most {} ciphertexts may be summed \
+         (each {}-bit chunk limb is at most {}; {} limbs sum to at most {} > 2^{}−1)",
+        batch_size,
+        max_b,
+        chunk_bits,
+        max_chunk_value(chunk_bits),
+        batch_size,
+        batch_size as u128 * max_chunk_value(chunk_bits),
+        range_bits,
+    );
+}
+
+fn point_key_into<G: PrimeGroup>(p: &G, buf: &mut Vec<u8>) -> [u8; DLOG_KEY_BYTES] {
+    buf.clear();
+    p.serialize_uncompressed(&mut *buf).unwrap();
+    buf[0..DLOG_KEY_BYTES].try_into().expect("slice length")
+}
+
+/// Baby-step / giant-step DLog solver for exponents in `[0, 2^log_max_input)`.
+///
+/// Giant steps are at multiples of `2^log_bases` (i.e. `g^{j · 2^log_bases}` for `j = 0..2^log_markers`).
+/// At solve time, `2^log_bases` baby steps are taken from the target, and each is checked against
+/// the stored giants.
+///
+/// Storage: `O(2^log_markers)` hash-map entries.
+/// Solve:   `O(2^log_bases)` group additions + hash lookups.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Markers<G: PrimeGroup> {
     pub log_max_input: usize,
     pub log_markers: usize,
-    pub markers_map: std::collections::HashMap<[u8; 6], usize>,
-    _phantom: std::marker::PhantomData<G>,
+    markers_map: std::collections::HashMap<[u8; DLOG_KEY_BYTES], usize>,
+    _phantom: PhantomData<G>,
 }
 
 impl<G: PrimeGroup> Markers<G> {
-    pub fn new(log_max_input: usize, log_markers: usize) -> Self {
+    /// Builds a BSGS table using the default parameters ([`DLOG_RANGE_BITS`], [`DLOG_MARKER_BITS`]).
+    pub fn new() -> Self {
+        Self::with_params(DLOG_RANGE_BITS, DLOG_MARKER_BITS)
+    }
+
+    /// Builds a BSGS table with custom parameters.
+    ///
+    /// `log_max_input` = total range bits, `log_markers` = giant-step count bits.
+    /// Baby-step count = `2^(log_max_input - log_markers)`.
+    pub fn with_params(log_max_input: usize, log_markers: usize) -> Self {
+        assert!(
+            log_max_input >= log_markers,
+            "log_max_input must be >= log_markers"
+        );
         let log_bases = log_max_input - log_markers;
 
-        // markers at evenly spaced 2^size points between 0 and 2^{2*size}
-        let timer = start_timer!(|| "computing markers");
+        let timer = start_timer!(|| format!(
+            "computing BSGS markers (2^{} giants, 2^{} babies)",
+            log_markers, log_bases
+        ));
+
+        let step = G::generator() * G::ScalarField::from(1u64 << log_bases);
         let mut marker = G::zero();
-        let diff = G::generator() * G::ScalarField::from(1 << log_bases);
-        let mut markers_map = std::collections::HashMap::new();
+        let num_markers = (1usize << log_markers) + 1;
+        let mut markers_map =
+            std::collections::HashMap::with_capacity(num_markers);
+        let mut buf = Vec::with_capacity(1024);
 
-        let mut bytes = Vec::new();
-        marker.serialize_uncompressed(&mut bytes).unwrap();
-        let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
-        markers_map.insert(hash, 0);
-
-        for i in 1..(1 << log_markers) {
-            marker += diff;
-
-            let mut bytes = Vec::new();
-            marker.serialize_uncompressed(&mut bytes).unwrap();
-            let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
-            markers_map.insert(hash, i);
+        markers_map.insert(point_key_into(&marker, &mut buf), 0);
+        for i in 1..num_markers {
+            marker += step;
+            markers_map.insert(point_key_into(&marker, &mut buf), i);
         }
         end_timer!(timer);
 
-        Markers {
+        Self {
             log_max_input,
             log_markers,
             markers_map,
-            _phantom: std::marker::PhantomData,
+            _phantom: PhantomData,
         }
     }
 
-    // save to file
     pub fn save_to_file(&self, path: &str) {
         let file = std::fs::File::create(path).unwrap();
         let mut writer = std::io::BufWriter::new(file);
         bincode::serialize_into(&mut writer, self).unwrap();
     }
 
-    // read from file
     pub fn read_from_file(path: &str) -> Self {
         let file = std::fs::File::open(path).unwrap();
         let reader = std::io::BufReader::new(file);
         bincode::deserialize_from(reader).unwrap()
     }
 
+    /// Solves `target = g^x` for `x ∈ [0, 2^log_max_input)` via baby-step / giant-step.
+    ///
+    /// Takes `2^log_bases` baby steps from the target, checking each against the stored giants.
+    /// Returns `None` if the exponent is out of range.
     pub fn compute_dlog(&self, target: &G) -> Option<G::ScalarField> {
         let log_bases = self.log_max_input - self.log_markers;
-        let mut darts = vec![G::zero(); 1 << log_bases]; // throwing darts hoping they will hit one of the markers
-        let gen_t = G::generator();
-        darts[0] = *target + gen_t;
-        for i in 1..(1 << log_bases) {
-            darts[i] = darts[i - 1] + gen_t;
-        }
+        let num_steps = 1usize << log_bases;
+        let gen = G::generator();
+        let mut buf = Vec::with_capacity(1024);
 
-        // check for intersection between darts and markers_map
-        for i in 0..(1 << log_bases) {
-            let mut bytes = Vec::new();
-            darts[i].serialize_uncompressed(&mut bytes).unwrap();
-            let hash: [u8; 6] = Sha256::digest(&bytes)[0..6].try_into().unwrap();
-
-            if let Some(&j) = self.markers_map.get(&hash) {
-                return Some(G::ScalarField::from(((1 << log_bases) * j - i - 1) as u128));
+        let mut dart = *target + gen;
+        for i in 0..num_steps {
+            let key = point_key_into(&dart, &mut buf);
+            if let Some(&j) = self.markers_map.get(&key) {
+                let x = (j << log_bases).wrapping_sub(i).wrapping_sub(1);
+                return Some(G::ScalarField::from(x as u128));
             }
+            dart += gen;
         }
 
         None
@@ -91,39 +173,43 @@ mod tests {
     use ark_ec::pairing::{Pairing, PairingOutput};
 
     type E = ark_bls12_381::Bls12_381;
-    // type G1 = <E as Pairing>::G1;
-    // type G2 = <E as Pairing>::G2;
     type Fr = <E as Pairing>::ScalarField;
     type GT = PairingOutput<E>;
 
     #[test]
     fn test_compute_dlog() {
-        let log_max_input = 41;
-        let log_markers = 25;
-        // sample a random value between 0 and 2^size
-        let random_value: u128 = 100;
-        let should_be_dlog = Fr::from(random_value);
+        let path = "markers_bsgs_test.bin";
 
+        let should_be_dlog = Fr::from(100u64);
         let target = GT::generator() * should_be_dlog;
-        let path = &format!("markers_{}_{}.bin", log_max_input, log_markers);
 
-        // Read markers from file if exists, else create new and save
         let timer = start_timer!(|| "loading markers");
         let markers = if std::path::Path::new(path).exists() {
             Markers::<GT>::read_from_file(path)
         } else {
-            println!("Markers file not found, generating new markers...");
-            let m = Markers::<GT>::new(log_max_input, log_markers);
+            let m = Markers::<GT>::new();
             m.save_to_file(path);
             m
         };
         end_timer!(timer);
-        let timer = start_timer!(|| "computing dlog");
+
         let computed_dlog = markers.compute_dlog(&target).unwrap();
-        end_timer!(timer);
-        assert_eq!(
-            computed_dlog, should_be_dlog,
-            "Computed DLog from markers does not match the expected value"
-        );
+        assert_eq!(computed_dlog, should_be_dlog);
+    }
+
+    #[test]
+    fn test_compute_dlog_large() {
+        let markers = Markers::<GT>::new();
+        // 512 ciphertexts × max 16-bit chunk = 512 * 65535 = 33_553_920
+        let large_val = 33_553_920u128;
+        let target = GT::generator() * Fr::from(large_val);
+        let result = markers.compute_dlog(&target).unwrap();
+        assert_eq!(result, Fr::from(large_val));
+    }
+
+    #[test]
+    fn max_batch_with_bsgs() {
+        assert_eq!(max_homomorphic_batch_size(16, DLOG_RANGE_BITS), 512);
+        assert_eq!(max_homomorphic_batch_size(8, DLOG_RANGE_BITS), 131_586);
     }
 }

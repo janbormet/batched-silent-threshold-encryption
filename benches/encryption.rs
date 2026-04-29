@@ -1,13 +1,16 @@
 use ark_std::{end_timer, start_timer, test_rng};
 use criterion::{criterion_group, criterion_main, Criterion};
-use silent_batched_threshold_encryption::{bte, ste};
+use silent_batched_threshold_encryption::{
+    bte::{self, encryption::NUM_CHUNKS},
+    ste,
+};
 
 type E = ark_bls12_381::Bls12_381;
 
 fn bench_encrypt(c: &mut Criterion) {
     let mut rng = test_rng();
     let n = 1 << 3;
-    let l = 8;
+    let l = NUM_CHUNKS;
     let batch_size = 512;
     let t: usize = n / 2;
 
