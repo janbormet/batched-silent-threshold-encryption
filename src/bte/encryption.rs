@@ -22,6 +22,12 @@ pub struct Ciphertext<E: Pairing> {
     pub mask: PairingOutput<E>, // todo: message masked with bytes
 }
 
+#[derive(Clone, Debug)]
+pub struct EncryptionWitness<E: Pairing> {
+    pub chunks: Vec<E::ScalarField>,
+    pub ste_randomness: ste::encryption::EncryptionRandomness<E>,
+}
+
 /// Sample a key, puncture it at position, and mask message at that evaluation point.
 pub fn encrypt<E: Pairing>(
     position: usize,
@@ -31,6 +37,18 @@ pub fn encrypt<E: Pairing>(
     t: usize,
     rng: &mut impl Rng,
 ) -> Ciphertext<E> {
+    encrypt_with_witness(position, bte_crs, ste_crs, ek, t, rng).0
+}
+
+/// Same as [`encrypt`], but also returns the witness needed by the CCA validity proof.
+pub fn encrypt_with_witness<E: Pairing>(
+    position: usize,
+    bte_crs: &bte::crs::CRS<E>,
+    ste_crs: &ste::crs::CRS<E>,
+    ek: &EncryptionKey<E>,
+    t: usize,
+    rng: &mut impl Rng,
+) -> (Ciphertext<E>, EncryptionWitness<E>) {
     let prf = PRF::<E>::new(rng);
     let pprf = prf.puncture(position, &bte_crs);
 
@@ -48,13 +66,21 @@ pub fn encrypt<E: Pairing>(
     let chunks_t = chunks.iter().map(|c| gen_t * c).collect::<Vec<_>>();
 
     // encrypt the key using the STE encryption scheme
-    let encrypted_key = ste::encryption::encrypt(&ek, t, &ste_crs, &chunks_t, rng);
+    let (encrypted_key, ste_randomness) =
+        ste::encryption::encrypt_with_witness(&ek, t, &ste_crs, &chunks_t, rng);
 
-    Ciphertext {
+    let ciphertext = Ciphertext {
         pprf,
         encrypted_key,
         mask: prf.eval(position, &bte_crs),
-    }
+    };
+    (
+        ciphertext,
+        EncryptionWitness {
+            chunks,
+            ste_randomness,
+        },
+    )
 }
 
 #[cfg(test)]
