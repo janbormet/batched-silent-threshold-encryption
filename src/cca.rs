@@ -1267,7 +1267,7 @@ mod tests {
         impl Rng,
     ) {
         let mut rng = test_rng();
-        let n = 64;
+        let n = (2 * CHUNK_BITS as usize + 3).next_power_of_two();
         let l = bte::encryption::NUM_CHUNKS;
         let batch_size = 8;
         let bte_crs = bte::crs::CRS::<E>::new(batch_size, &mut rng);

@@ -7,12 +7,24 @@ use ark_ec::PrimeGroup;
 use ark_ff::PrimeField;
 use ark_std::{rand::Rng, Zero};
 
+#[cfg(all(feature = "chunks-8", feature = "chunks-16"))]
+compile_error!("features `chunks-8` and `chunks-16` are mutually exclusive");
+
+#[cfg(not(any(feature = "chunks-8", feature = "chunks-16")))]
+compile_error!("enable exactly one chunk parameter feature: `chunks-8` or `chunks-16`");
+
 /// Bits per STE / GT chunk when decomposing the PRF scalar (must match `ste_crs.l`).
 /// Each chunk limb is in `[0, 2^CHUNK_BITS − 1]`. After homomorphically summing `B` ciphertexts,
 /// a slot sum is at most `B · (2^CHUNK_BITS − 1)`; see [`crate::dlog::max_homomorphic_batch_size`].
+#[cfg(feature = "chunks-16")]
 pub const CHUNK_BITS: u32 = 16;
+#[cfg(feature = "chunks-8")]
+pub const CHUNK_BITS: u32 = 32;
 /// Number of chunks; `CHUNK_BITS * NUM_CHUNKS` must cover the scalar field (~255 bits for BLS12-381).
+#[cfg(feature = "chunks-16")]
 pub const NUM_CHUNKS: usize = 16;
+#[cfg(feature = "chunks-8")]
+pub const NUM_CHUNKS: usize = 8;
 
 #[derive(Clone, Debug)]
 pub struct Ciphertext<E: Pairing> {
